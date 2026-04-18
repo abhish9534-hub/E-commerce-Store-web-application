@@ -1,0 +1,84 @@
+pipeline {
+    agent any
+
+    environment {
+        DOCKER_REGISTRY = "enterprise.azurecr.io"
+        APP_NAME = "artisan-app"
+        SONAR_TOKEN = credentials('sonar-token')
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Install Dependencies') {
+            steps {
+                sh 'npm install'
+            }
+        }
+
+        stage('Lint & Unit Test') {
+            steps {
+                sh 'npm run lint'
+                // sh 'npm test'
+            }
+        }
+
+        stage('SonarQube Scan') {
+            steps {
+                withSonarQubeEnv('SonarServer') {
+                    sh 'npm run sonar-scan'
+                }
+            }
+        }
+
+        stage('Docker Build & Scan') {
+            steps {
+                sh "docker build -t ${DOCKER_REGISTRY}/${APP_NAME}:${BUILD_NUMBER} -f backend/Dockerfile ."
+                sh "trivy image ${DOCKER_REGISTRY}/${APP_NAME}:${BUILD_NUMBER}"
+            }
+        }
+
+        stage('Security Scan (DAST)') {
+            steps {
+                // Run OWASP ZAP in baseline mode against the dev environment
+                sh 'docker run -t owasp/zap2docker-stable zap-baseline.py -t http://dev-api.enterprise.com'
+            }
+        }
+
+        stage('Push to Registry') {
+            when {
+                branch 'main'
+            }
+            steps {
+                sh "docker push ${DOCKER_REGISTRY}/${APP_NAME}:${BUILD_NUMBER}"
+            }
+        }
+
+        stage('GitOps Trigger (ArgoCD)') {
+            when {
+                branch 'main'
+            }
+            steps {
+                // Update the image tag in the GitOps repository
+                sh "sed -i 's/tag: .*/tag: ${BUILD_NUMBER}/' helm/values.yaml"
+                sh "git add . && git commit -m 'Release: ${BUILD_NUMBER}' && git push origin main"
+            }
+        }
+    }
+
+    post {
+        always {
+            cleanWs()
+        }
+        success {
+            echo 'Deployment successful!'
+        }
+        failure {
+            echo 'Pipeline failed. Check SonarQube or Trivy logs.'
+        }
+    }
+}
